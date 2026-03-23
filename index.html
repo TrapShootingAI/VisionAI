@@ -523,42 +523,132 @@ function startCVLoop(){
   loop();
 }
 
+// How many consecutive frames we've seen the clay
+let trackFrameCount=0;
+// Smoothed blob position for stable box
+let smoothBlob=null;
+
 function analyzeFrame(){
   const w=canvas.width,h=canvas.height;
   const img=ctx.getImageData(0,0,w,h);
   const d=img.data;
   let minX=w,minY=h,maxX=0,maxY=0,pixels=0;
-  for(let y=0;y<h;y+=3){for(let x=0;x<w;x+=3){
-    const i=(y*w+x)*4;
-    if(isOrange(d[i],d[i+1],d[i+2])){
-      pixels++;
-      if(x<minX)minX=x;if(x>maxX)maxX=x;
-      if(y<minY)minY=y;if(y>maxY)maxY=y;
+
+  for(let y=0;y<h;y+=3){
+    for(let x=0;x<w;x+=3){
+      const i=(y*w+x)*4;
+      if(isOrange(d[i],d[i+1],d[i+2])){
+        pixels++;
+        if(x<minX)minX=x;if(x>maxX)maxX=x;
+        if(y<minY)minY=y;if(y>maxY)maxY=y;
+      }
     }
-  }}
-  const blobs=pixels>15?[{minX,minY,maxX,maxY,pixels}]:[];
-  if(blobs.length){
-    ctx.strokeStyle='rgba(255,107,0,0.9)';ctx.lineWidth=3;
-    ctx.strokeRect(minX,minY,maxX-minX,maxY-minY);
-    ctx.fillStyle='rgba(255,107,0,0.9)';ctx.font='bold 14px monospace';
-    ctx.fillText('🎯 '+pixels+'px',minX,minY-5);
   }
-  // Fragmentation detection
-  if(prevBlobs.length&&blobs.length){
-    const p=prevBlobs[0],c=blobs[0];
-    if(((c.maxX-c.minX)>(p.maxX-p.minX)*1.8||c.pixels>p.pixels*2)&&!fragDetected){
+
+  // Require at least 40 orange pixels to avoid noise triggering
+  const detected=pixels>40;
+  const blob=detected?{minX,minY,maxX,maxY,pixels}:null;
+
+  if(detected){
+    trackFrameCount++;
+    // Smooth the box position over frames to reduce jitter
+    if(!smoothBlob){smoothBlob={...blob};}
+    else{
+      const a=0.4; // smoothing factor
+      smoothBlob.minX=smoothBlob.minX*(1-a)+blob.minX*a;
+      smoothBlob.minY=smoothBlob.minY*(1-a)+blob.minY*a;
+      smoothBlob.maxX=smoothBlob.maxX*(1-a)+blob.maxX*a;
+      smoothBlob.maxY=smoothBlob.maxY*(1-a)+blob.maxY*a;
+      smoothBlob.pixels=blob.pixels;
+    }
+    drawTargetBox(smoothBlob,trackFrameCount);
+  } else {
+    smoothBlob=null;
+  }
+
+  // ── Fragmentation detection ────────────────────────────
+  // Only trigger if we've been tracking for at least 4 frames (real clay, not noise)
+  if(prevBlobs.length&&blob&&trackFrameCount>=4){
+    const p=prevBlobs[0];
+    const prevW=p.maxX-p.minX,curW=blob.maxX-blob.minX;
+    const prevH=p.maxY-p.minY,curH=blob.maxY-blob.minY;
+    const widthExplosion=curW>prevW*2.5;
+    const pixelExplosion=blob.pixels>p.pixels*3;
+    if((widthExplosion||pixelExplosion)&&!fragDetected){
       fragDetected=true;
       updateTrigBar('✅','HIT DETECTED','Fragmentation confirmed');
       recordShot(true);
     }
-  } else if(prevBlobs.length&&!blobs.length&&!fragDetected){
-    setTimeout(()=>{if(!fragDetected&&aiMode){updateTrigBar('❌','MISS — CLAY GONE','No fragmentation detected');recordShot(false);}},250);
+  } else if(prevBlobs.length&&!blob&&trackFrameCount>=4&&!fragDetected){
+    // Clay was tracked for enough frames then vanished
+    setTimeout(()=>{
+      if(!fragDetected&&aiMode){
+        updateTrigBar('❌','MISS — CLAY GONE','No fragmentation detected');
+        recordShot(false);
+      }
+    },300);
   }
-  if(blobs.length){ctx.fillStyle='rgba(0,229,255,0.8)';ctx.font='bold 13px monospace';ctx.fillText('🔍 TRACKING',8,20);}
-  prevBlobs=blobs;
+
+  if(!detected){trackFrameCount=0;}
+  prevBlobs=blob?[blob]:[];
 }
 
-function isOrange(r,g,b){return r>170&&g>60&&g<170&&b<70&&r>g*1.5;}
+function drawTargetBox(b,frames){
+  const x=b.minX,y=b.minY;
+  const bw=b.maxX-b.minX,bh=b.maxY-b.minY;
+  // Pad the box a bit
+  const pad=12;
+  const rx=x-pad,ry=y-pad,rw=bw+pad*2,rh=bh+pad*2;
+  const cx=rx+rw/2,cy=ry+rh/2;
+  const cornerLen=Math.min(20,rw*0.3);
+
+  // Colour: yellow when first detected, orange once locked (4+ frames)
+  const locked=frames>=4;
+  const col=locked?'#ff6b00':'#ffd700';
+  const colFaint=locked?'rgba(255,107,0,0.25)':'rgba(255,215,0,0.2)';
+
+  // Semi-transparent fill
+  ctx.fillStyle=colFaint;
+  ctx.fillRect(rx,ry,rw,rh);
+
+  // Corner brackets
+  ctx.strokeStyle=col;ctx.lineWidth=3;ctx.lineCap='square';
+  // TL
+  ctx.beginPath();ctx.moveTo(rx,ry+cornerLen);ctx.lineTo(rx,ry);ctx.lineTo(rx+cornerLen,ry);ctx.stroke();
+  // TR
+  ctx.beginPath();ctx.moveTo(rx+rw-cornerLen,ry);ctx.lineTo(rx+rw,ry);ctx.lineTo(rx+rw,ry+cornerLen);ctx.stroke();
+  // BL
+  ctx.beginPath();ctx.moveTo(rx,ry+rh-cornerLen);ctx.lineTo(rx,ry+rh);ctx.lineTo(rx+cornerLen,ry+rh);ctx.stroke();
+  // BR
+  ctx.beginPath();ctx.moveTo(rx+rw-cornerLen,ry+rh);ctx.lineTo(rx+rw,ry+rh);ctx.lineTo(rx+rw,ry+rh-cornerLen);ctx.stroke();
+
+  // Crosshair
+  ctx.strokeStyle='rgba(255,255,255,0.4)';ctx.lineWidth=1;ctx.setLineDash([4,4]);
+  ctx.beginPath();ctx.moveTo(cx-rw*0.4,cy);ctx.lineTo(cx+rw*0.4,cy);ctx.stroke();
+  ctx.beginPath();ctx.moveTo(cx,cy-rh*0.4);ctx.lineTo(cx,cy+rh*0.4);ctx.stroke();
+  ctx.setLineDash([]);
+
+  // Label
+  ctx.fillStyle=col;
+  ctx.font='bold 13px monospace';
+  const label=locked?'🎯 LOCKED ('+b.pixels+'px)':'🔍 DETECTING ('+b.pixels+'px)';
+  ctx.fillText(label,rx,ry-8);
+
+  // Confidence bar below box
+  const conf=Math.min(frames/8,1);
+  ctx.fillStyle='rgba(0,0,0,0.5)';ctx.fillRect(rx,ry+rh+4,rw,6);
+  ctx.fillStyle=locked?'#ff6b00':'#ffd700';ctx.fillRect(rx,ry+rh+4,rw*conf,6);
+
+  // Status overlay top-left
+  ctx.fillStyle='rgba(0,0,0,0.5)';ctx.fillRect(0,0,180,28);
+  ctx.fillStyle=locked?'#ff6b00':'#00e5ff';ctx.font='bold 14px monospace';
+  ctx.fillText(locked?'🎯 TRACKING':'🔍 ACQUIRING',8,20);
+}
+
+function isOrange(r,g,b){
+  // Orange clay — high red, medium green, very low blue
+  return r>160&&g>50&&g<160&&b<60&&r>g*1.6&&r>140;
+}
 
 // ── Audio ─────────────────────────────────────────────────
 async function startAudio(){
@@ -637,7 +727,7 @@ function onTrigger(src){
   setDot('dotTrack','warn','WAITING');
   delayTimeout=setTimeout(()=>{
     if(!aiActive)return;
-    fragDetected=false;prevBlobs=[];
+    fragDetected=false;prevBlobs=[];trackFrameCount=0;smoothBlob=null;
     updateTrigBar('🔍','TRACKING CLAY','Analyzing fragmentation...');
     setDot('dotTrack','on','TRACKING');
     trackTimeout=setTimeout(()=>{
@@ -672,7 +762,7 @@ function recordShot(hit){
   if(aiMode){
     setDot('dotTrack','','IDLE');
     updateTrigBar('👂','LISTENING','Waiting for "PULL" or bang');
-    pullDetected=false;prevBlobs=[];
+    pullDetected=false;prevBlobs=[];trackFrameCount=0;smoothBlob=null;
     setTimeout(()=>{fragDetected=false;},500);
   }
   shooterTurnIdx++;
