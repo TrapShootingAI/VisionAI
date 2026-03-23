@@ -458,7 +458,7 @@ let activeOrder=[],roundStartTime=null,roundResults=null;
 let aiMode=false;
 let aiActive=false;
 let pullDetected=false,bangCooldown=false,fragDetected=false;
-let trackTimeout=null,delayTimeout=null,prevBlobs=[];
+let trackTimeout=null,delayTimeout=null;
 let stream=null,audioCtx=null,analyser=null,recognition=null,animFrame=null;
 let cfg={bangThreshold:120,shotDelay:200,trackDuration:1500,voiceConfidence:0.75};
 
@@ -481,6 +481,7 @@ function toggleAI(){
 async function startAISession(){
   if(aiActive)return;
   aiActive=true;
+  startWorker();
   await startCamera();
   await startAudio();
   startVoice();
@@ -488,10 +489,10 @@ async function startAISession(){
 
 function stopAISession(){
   aiActive=false;
+  stopWorker();
   if(stream){stream.getTracks().forEach(t=>t.stop());stream=null;}
   if(audioCtx){audioCtx.close();audioCtx=null;analyser=null;}
   if(recognition){try{recognition.stop();}catch(e){}}
-  if(animFrame){cancelAnimationFrame(animFrame);animFrame=null;}
   clearTimeout(trackTimeout);clearTimeout(delayTimeout);
   document.getElementById('camOverlay').style.display='flex';
   setDot('dotCam','','CAMERA OFF');setDot('dotMic','','MIC OFF');
@@ -512,143 +513,295 @@ async function startCamera(){
   }catch(e){setDot('dotCam','err','CAMERA ERROR');addShootLog('auto','Camera: '+e.message,null);}
 }
 
+// ── CV Worker ─────────────────────────────────────────────
+let cvWorker=null;
+let trackFrameCount=0;
+let smoothTracks={}; // id → smoothed box
+
+const WORKER_CODE=`
+const IOU_THRESH=0.3;
+const MAX_MISSES=10;
+const FRAG_THRESH=7.0;
+const MIN_BLOB_PX=8;
+let gunshotWindow=false;
+let tracks=[];
+let nextId=1;
+let ort=null,session=null,modelLoaded=false;
+
+function iou(a,b){
+  const x1=Math.max(a.x,b.x),y1=Math.max(a.y,b.y);
+  const x2=Math.min(a.x+a.w,b.x+b.w),y2=Math.min(a.y+a.h,b.y+b.h);
+  if(x2<=x1||y2<=y1)return 0;
+  const inter=(x2-x1)*(y2-y1);
+  return inter/(a.w*a.h+b.w*b.h-inter);
+}
+
+function floodFill(id,smallW,smallH,startX,startY,visited,thresh){
+  const stack=[[startX,startY]];
+  let minx=startX,miny=startY,maxx=startX,maxy=startY,count=0;
+  while(stack.length){
+    const [cx,cy]=stack.pop();
+    if(cx<0||cy<0||cx>=smallW||cy>=smallH)continue;
+    const idx=cy*smallW+cx;
+    if(visited[idx])continue;
+    visited[idx]=1;
+    const ii=idx*4;
+    const g=(id.data[ii]+id.data[ii+1]+id.data[ii+2])/3;
+    if(g<=thresh)continue;
+    count++;
+    minx=Math.min(minx,cx);miny=Math.min(miny,cy);
+    maxx=Math.max(maxx,cx);maxy=Math.max(maxy,cy);
+    stack.push([cx+1,cy],[cx-1,cy],[cx,cy+1],[cx,cy-1]);
+  }
+  return {count,minx,miny,maxx,maxy};
+}
+
+function detectBlobs(off,origW,origH){
+  const smallW=Math.max(160,Math.floor(origW/4));
+  const smallH=Math.max(90,Math.floor(origH/4));
+  const small=new OffscreenCanvas(smallW,smallH);
+  const sctx=small.getContext('2d');
+  sctx.drawImage(off,0,0,smallW,smallH);
+  const id=sctx.getImageData(0,0,smallW,smallH);
+  const thresh=200;
+  const visited=new Uint8Array(smallW*smallH);
+  const dets=[];
+  const scaleX=origW/smallW,scaleY=origH/smallH;
+  for(let y=0;y<smallH;y++){
+    for(let x=0;x<smallW;x++){
+      const i=(y*smallW+x)*4;
+      const g=(id.data[i]+id.data[i+1]+id.data[i+2])/3;
+      if(g>thresh&&!visited[y*smallW+x]){
+        const r=floodFill(id,smallW,smallH,x,y,visited,thresh);
+        if(r.count>MIN_BLOB_PX){
+          dets.push({
+            x:Math.floor(r.minx*scaleX),
+            y:Math.floor(r.miny*scaleY),
+            w:Math.ceil((r.maxx-r.minx+1)*scaleX),
+            h:Math.ceil((r.maxy-r.miny+1)*scaleY),
+            score:Math.min(0.99,r.count/120)
+          });
+        }
+      }
+    }
+  }
+  return dets;
+}
+
+function fragScore(off,box){
+  const cw=Math.max(16,Math.min(256,box.w));
+  const ch=Math.max(16,Math.min(256,box.h));
+  const crop=new OffscreenCanvas(cw,ch);
+  const cctx=crop.getContext('2d');
+  cctx.drawImage(off,box.x,box.y,box.w,box.h,0,0,cw,ch);
+  const img=cctx.getImageData(0,0,cw,ch);
+  let sum=0;
+  for(let y=1;y<ch-1;y++){
+    for(let x=1;x<cw-1;x++){
+      const i=(y*cw+x)*4;
+      const g=(img.data[i]+img.data[i+1]+img.data[i+2])/3;
+      const gL=(img.data[i-4]+img.data[i+4]+img.data[i-4*cw]+img.data[i+4*cw])/12;
+      sum+=Math.abs(g-gL);
+    }
+  }
+  return sum/(cw*ch);
+}
+
+function updateTracks(dets,t){
+  for(const tr of tracks)tr.missed++;
+  for(const d of dets){
+    let best=null,bestScore=0;
+    for(const tr of tracks){
+      const sc=iou(d,tr.box);
+      if(sc>bestScore){bestScore=sc;best=tr;}
+    }
+    if(best&&bestScore>IOU_THRESH){
+      best.box=d;best.missed=0;best.lastSeen=t;best.frames++;
+      best.history.push({t,box:{...d}});
+    } else {
+      tracks.push({id:nextId++,box:d,missed:0,created:t,lastSeen:t,frames:1,history:[{t,box:{...d}}],hit:false,frag:0});
+    }
+  }
+  tracks=tracks.filter(tr=>tr.missed<=MAX_MISSES);
+}
+
+self.onmessage=async(e)=>{
+  const msg=e.data;
+  if(msg.type==='init'){
+    if(msg.ortUrl){
+      try{
+        importScripts(msg.ortUrl);
+        ort=self.ort;
+        if(msg.modelUrl){
+          session=await ort.InferenceSession.create(msg.modelUrl);
+          modelLoaded=true;
+          self.postMessage({type:'log',text:'ONNX model loaded ✓'});
+        } else {
+          self.postMessage({type:'log',text:'No model — using flood-fill fallback'});
+        }
+      }catch(err){
+        self.postMessage({type:'log',text:'ONNX unavailable: '+err.message+' — using fallback'});
+      }
+    }
+  } else if(msg.type==='gunshot'){
+    gunshotWindow=true;
+    setTimeout(()=>{gunshotWindow=false;},msg.windowMs||2000);
+  } else if(msg.type==='frame'){
+    const bitmap=msg.bitmap;
+    const t=msg.t;
+    if(!gunshotWindow&&!msg.force){bitmap.close();return;}
+    const off=new OffscreenCanvas(bitmap.width,bitmap.height);
+    off.getContext('2d').drawImage(bitmap,0,0);
+    bitmap.close();
+    let dets=[];
+    if(modelLoaded&&session){
+      // ONNX slot — model preprocessing would go here
+    }
+    if(!dets.length){
+      dets=detectBlobs(off,bitmap.width||off.width,bitmap.height||off.height);
+    }
+    updateTracks(dets,t);
+    const out=tracks.map(tr=>{
+      const frag=fragScore(off,tr.box);
+      tr.frag=frag;
+      if(frag>FRAG_THRESH&&tr.frames>=3)tr.hit=true;
+      return {id:tr.id,x:tr.box.x,y:tr.box.y,w:tr.box.w,h:tr.box.h,conf:tr.box.score||0,hit:tr.hit,frag:frag,frames:tr.frames,missed:tr.missed};
+    });
+    self.postMessage({type:'draw',tracks:out,t});
+  }
+};
+`;
+
+function startWorker(){
+  if(cvWorker)cvWorker.terminate();
+  const blob=new Blob([WORKER_CODE],{type:'application/javascript'});
+  const url=URL.createObjectURL(blob);
+  cvWorker=new Worker(url);
+  URL.revokeObjectURL(url);
+  cvWorker.postMessage({
+    type:'init',
+    ortUrl:'https://cdn.jsdelivr.net/npm/onnxruntime-web/dist/ort.min.js',
+    modelUrl:null // set to '/assets/models/yolo_tiny.onnx' when model is available
+  });
+  cvWorker.onmessage=function(e){
+    const m=e.data;
+    if(m.type==='draw')drawTracks(m.tracks);
+    if(m.type==='log')addShootLog('auto',m.text,null);
+  };
+}
+
+function stopWorker(){
+  if(cvWorker){cvWorker.terminate();cvWorker=null;}
+  smoothTracks={};trackFrameCount=0;
+}
+
+// Frame loop — sends bitmaps to worker
 function startCVLoop(){
+  let running=true;
+  animFrame=running;
   function loop(){
-    if(!aiActive)return;
-    animFrame=requestAnimationFrame(loop);
-    if(video.readyState<2)return;
-    ctx.drawImage(video,0,0,canvas.width,canvas.height);
-    if(aiMode&&!waitRotate&&!roundDone)analyzeFrame();
+    if(!aiActive){running=false;return;}
+    if(video.readyState>=2){
+      createImageBitmap(video).then(function(bitmap){
+        if(cvWorker&&aiMode&&!waitRotate&&!roundDone){
+          cvWorker.postMessage({type:'frame',bitmap,t:performance.now(),force:false},[bitmap]);
+        } else {
+          bitmap.close();
+          // Still draw the video frame on canvas for display
+          ctx.drawImage(video,0,0,canvas.width,canvas.height);
+        }
+      }).catch(function(){});
+    }
+    requestAnimationFrame(loop);
   }
   loop();
 }
 
-// How many consecutive frames we've seen the clay
-let trackFrameCount=0;
-// Smoothed blob position for stable box
-let smoothBlob=null;
+// Tell worker a shot was triggered — open analysis window
+function notifyWorkerGunshot(){
+  if(cvWorker)cvWorker.postMessage({type:'gunshot',windowMs:cfg.trackDuration+cfg.shotDelay+500});
+}
 
-function analyzeFrame(){
-  const w=canvas.width,h=canvas.height;
-  const img=ctx.getImageData(0,0,w,h);
-  const d=img.data;
-  let minX=w,minY=h,maxX=0,maxY=0,pixels=0;
-
-  for(let y=0;y<h;y+=3){
-    for(let x=0;x<w;x+=3){
-      const i=(y*w+x)*4;
-      if(isOrange(d[i],d[i+1],d[i+2])){
-        pixels++;
-        if(x<minX)minX=x;if(x>maxX)maxX=x;
-        if(y<minY)minY=y;if(y>maxY)maxY=y;
-      }
-    }
-  }
-
-  // Require at least 40 orange pixels to avoid noise triggering
-  const detected=pixels>40;
-  const blob=detected?{minX,minY,maxX,maxY,pixels}:null;
-
-  if(detected){
-    trackFrameCount++;
-    // Smooth the box position over frames to reduce jitter
-    if(!smoothBlob){smoothBlob={...blob};}
+// Draw tracks on canvas (runs on main thread, light)
+function drawTracks(tracks){
+  ctx.drawImage(video,0,0,canvas.width,canvas.height);
+  tracks.forEach(function(t){
+    if(t.missed>0)return; // only draw live tracks
+    const locked=t.frames>=4;
+    // Smooth box position
+    if(!smoothTracks[t.id]){smoothTracks[t.id]={x:t.x,y:t.y,w:t.w,h:t.h};}
     else{
-      const a=0.4; // smoothing factor
-      smoothBlob.minX=smoothBlob.minX*(1-a)+blob.minX*a;
-      smoothBlob.minY=smoothBlob.minY*(1-a)+blob.minY*a;
-      smoothBlob.maxX=smoothBlob.maxX*(1-a)+blob.maxX*a;
-      smoothBlob.maxY=smoothBlob.maxY*(1-a)+blob.maxY*a;
-      smoothBlob.pixels=blob.pixels;
+      const s=smoothTracks[t.id];const a=0.35;
+      s.x=s.x*(1-a)+t.x*a;s.y=s.y*(1-a)+t.y*a;
+      s.w=s.w*(1-a)+t.w*a;s.h=s.h*(1-a)+t.h*a;
     }
-    drawTargetBox(smoothBlob,trackFrameCount);
-  } else {
-    smoothBlob=null;
-  }
+    const b=smoothTracks[t.id];
+    drawTargetBox(b,locked,t.hit,t.frag,t.conf);
 
-  // ── Fragmentation detection ────────────────────────────
-  // Only trigger if we've been tracking for at least 4 frames (real clay, not noise)
-  if(prevBlobs.length&&blob&&trackFrameCount>=4){
-    const p=prevBlobs[0];
-    const prevW=p.maxX-p.minX,curW=blob.maxX-blob.minX;
-    const prevH=p.maxY-p.minY,curH=blob.maxY-blob.minY;
-    const widthExplosion=curW>prevW*2.5;
-    const pixelExplosion=blob.pixels>p.pixels*3;
-    if((widthExplosion||pixelExplosion)&&!fragDetected){
+    // Fragmentation — auto record result
+    if(t.hit&&!fragDetected){
       fragDetected=true;
-      updateTrigBar('✅','HIT DETECTED','Fragmentation confirmed');
+      updateTrigBar('✅','HIT DETECTED','Fragmentation score: '+t.frag.toFixed(1));
       recordShot(true);
     }
-  } else if(prevBlobs.length&&!blob&&trackFrameCount>=4&&!fragDetected){
-    // Clay was tracked for enough frames then vanished
-    setTimeout(()=>{
+  });
+
+  // Check if all tracks disappeared = miss
+  const liveTracks=tracks.filter(t=>t.missed===0);
+  const prevLive=Object.keys(smoothTracks).length;
+  if(prevLive>0&&liveTracks.length===0&&!fragDetected&&trackFrameCount>=4){
+    setTimeout(function(){
       if(!fragDetected&&aiMode){
-        updateTrigBar('❌','MISS — CLAY GONE','No fragmentation detected');
+        updateTrigBar('❌','MISS — CLAY GONE','No fragmentation');
         recordShot(false);
       }
     },300);
   }
-
-  if(!detected){trackFrameCount=0;}
-  prevBlobs=blob?[blob]:[];
+  trackFrameCount=liveTracks.length>0?trackFrameCount+1:0;
+  if(liveTracks.length===0){smoothTracks={};}
 }
 
-function drawTargetBox(b,frames){
-  const x=b.minX,y=b.minY;
-  const bw=b.maxX-b.minX,bh=b.maxY-b.minY;
-  // Pad the box a bit
-  const pad=12;
-  const rx=x-pad,ry=y-pad,rw=bw+pad*2,rh=bh+pad*2;
+function drawTargetBox(b,locked,hit,frag,conf){
+  const pad=14;
+  const rx=b.x-pad,ry=b.y-pad,rw=b.w+pad*2,rh=b.h+pad*2;
   const cx=rx+rw/2,cy=ry+rh/2;
-  const cornerLen=Math.min(20,rw*0.3);
+  const cl=Math.min(22,rw*0.3);
+  const col=hit?'#00ff88':locked?'#ff6b00':'#ffd700';
+  const bg=hit?'rgba(0,255,136,0.15)':locked?'rgba(255,107,0,0.15)':'rgba(255,215,0,0.1)';
 
-  // Colour: yellow when first detected, orange once locked (4+ frames)
-  const locked=frames>=4;
-  const col=locked?'#ff6b00':'#ffd700';
-  const colFaint=locked?'rgba(255,107,0,0.25)':'rgba(255,215,0,0.2)';
-
-  // Semi-transparent fill
-  ctx.fillStyle=colFaint;
-  ctx.fillRect(rx,ry,rw,rh);
+  // Fill
+  ctx.fillStyle=bg;ctx.fillRect(rx,ry,rw,rh);
 
   // Corner brackets
   ctx.strokeStyle=col;ctx.lineWidth=3;ctx.lineCap='square';
-  // TL
-  ctx.beginPath();ctx.moveTo(rx,ry+cornerLen);ctx.lineTo(rx,ry);ctx.lineTo(rx+cornerLen,ry);ctx.stroke();
-  // TR
-  ctx.beginPath();ctx.moveTo(rx+rw-cornerLen,ry);ctx.lineTo(rx+rw,ry);ctx.lineTo(rx+rw,ry+cornerLen);ctx.stroke();
-  // BL
-  ctx.beginPath();ctx.moveTo(rx,ry+rh-cornerLen);ctx.lineTo(rx,ry+rh);ctx.lineTo(rx+cornerLen,ry+rh);ctx.stroke();
-  // BR
-  ctx.beginPath();ctx.moveTo(rx+rw-cornerLen,ry+rh);ctx.lineTo(rx+rw,ry+rh);ctx.lineTo(rx+rw,ry+rh-cornerLen);ctx.stroke();
+  ctx.beginPath();ctx.moveTo(rx,ry+cl);ctx.lineTo(rx,ry);ctx.lineTo(rx+cl,ry);ctx.stroke();
+  ctx.beginPath();ctx.moveTo(rx+rw-cl,ry);ctx.lineTo(rx+rw,ry);ctx.lineTo(rx+rw,ry+cl);ctx.stroke();
+  ctx.beginPath();ctx.moveTo(rx,ry+rh-cl);ctx.lineTo(rx,ry+rh);ctx.lineTo(rx+cl,ry+rh);ctx.stroke();
+  ctx.beginPath();ctx.moveTo(rx+rw-cl,ry+rh);ctx.lineTo(rx+rw,ry+rh);ctx.lineTo(rx+rw,ry+rh-cl);ctx.stroke();
 
   // Crosshair
-  ctx.strokeStyle='rgba(255,255,255,0.4)';ctx.lineWidth=1;ctx.setLineDash([4,4]);
-  ctx.beginPath();ctx.moveTo(cx-rw*0.4,cy);ctx.lineTo(cx+rw*0.4,cy);ctx.stroke();
-  ctx.beginPath();ctx.moveTo(cx,cy-rh*0.4);ctx.lineTo(cx,cy+rh*0.4);ctx.stroke();
+  ctx.strokeStyle='rgba(255,255,255,0.3)';ctx.lineWidth=1;ctx.setLineDash([3,5]);
+  ctx.beginPath();ctx.moveTo(cx-rw*0.35,cy);ctx.lineTo(cx+rw*0.35,cy);ctx.stroke();
+  ctx.beginPath();ctx.moveTo(cx,cy-rh*0.35);ctx.lineTo(cx,cy+rh*0.35);ctx.stroke();
   ctx.setLineDash([]);
 
   // Label
-  ctx.fillStyle=col;
-  ctx.font='bold 13px monospace';
-  const label=locked?'🎯 LOCKED ('+b.pixels+'px)':'🔍 DETECTING ('+b.pixels+'px)';
-  ctx.fillText(label,rx,ry-8);
+  ctx.fillStyle='rgba(0,0,0,0.6)';ctx.fillRect(rx,ry-22,rw,20);
+  ctx.fillStyle=col;ctx.font='bold 12px monospace';
+  const label=hit?'💥 HIT frag='+frag.toFixed(1):locked?'🎯 LOCKED frag='+frag.toFixed(1):'🔍 DETECTING '+Math.round(conf*100)+'%';
+  ctx.fillText(label,rx+4,ry-6);
 
-  // Confidence bar below box
-  const conf=Math.min(frames/8,1);
-  ctx.fillStyle='rgba(0,0,0,0.5)';ctx.fillRect(rx,ry+rh+4,rw,6);
-  ctx.fillStyle=locked?'#ff6b00':'#ffd700';ctx.fillRect(rx,ry+rh+4,rw*conf,6);
+  // Confidence bar
+  ctx.fillStyle='rgba(0,0,0,0.5)';ctx.fillRect(rx,ry+rh+3,rw,5);
+  ctx.fillStyle=col;ctx.fillRect(rx,ry+rh+3,rw*Math.min(conf*2,1),5);
 
-  // Status overlay top-left
-  ctx.fillStyle='rgba(0,0,0,0.5)';ctx.fillRect(0,0,180,28);
-  ctx.fillStyle=locked?'#ff6b00':'#00e5ff';ctx.font='bold 14px monospace';
-  ctx.fillText(locked?'🎯 TRACKING':'🔍 ACQUIRING',8,20);
+  // Status HUD
+  ctx.fillStyle='rgba(0,0,0,0.55)';ctx.fillRect(0,0,200,26);
+  ctx.fillStyle=hit?'#00ff88':locked?'#ff6b00':'#00e5ff';ctx.font='bold 13px monospace';
+  ctx.fillText(hit?'💥 FRAGMENTED':locked?'🎯 TRACKING':'🔍 ACQUIRING',6,18);
 }
 
-function isOrange(r,g,b){
-  // Orange clay — high red, medium green, very low blue
-  return r>160&&g>50&&g<160&&b<60&&r>g*1.6&&r>140;
-}
+function isOrange(r,g,b){return r>160&&g>50&&g<160&&b<60&&r>g*1.6&&r>140;}
 
 // ── Audio ─────────────────────────────────────────────────
 async function startAudio(){
@@ -723,19 +876,22 @@ function startVoice(){
 // ── Trigger pipeline ──────────────────────────────────────
 function onTrigger(src){
   if(waitRotate||roundDone)return;
+  fragDetected=false;trackFrameCount=0;smoothTracks={};
   updateTrigBar('💥',src==='voice'?'"PULL" HEARD':'BANG DETECTED','Waiting for shot impact...');
   setDot('dotTrack','warn','WAITING');
+  // Tell worker to open its analysis window after shot delay
   delayTimeout=setTimeout(()=>{
     if(!aiActive)return;
-    fragDetected=false;prevBlobs=[];trackFrameCount=0;smoothBlob=null;
+    notifyWorkerGunshot();
     updateTrigBar('🔍','TRACKING CLAY','Analyzing fragmentation...');
     setDot('dotTrack','on','TRACKING');
+    // Safety timeout — if worker doesn't report back, score as miss
     trackTimeout=setTimeout(()=>{
       if(!fragDetected&&aiMode){
         updateTrigBar('❌','TIMEOUT — MISS','No fragmentation in window');
         recordShot(false);
       }
-    },cfg.trackDuration);
+    },cfg.trackDuration+500);
   },cfg.shotDelay);
 }
 
@@ -762,7 +918,7 @@ function recordShot(hit){
   if(aiMode){
     setDot('dotTrack','','IDLE');
     updateTrigBar('👂','LISTENING','Waiting for "PULL" or bang');
-    pullDetected=false;prevBlobs=[];trackFrameCount=0;smoothBlob=null;
+    pullDetected=false;trackFrameCount=0;smoothTracks={};
     setTimeout(()=>{fragDetected=false;},500);
   }
   shooterTurnIdx++;
