@@ -331,6 +331,7 @@ input[type=range]{flex:1;accent-color:var(--orange);cursor:pointer}
           <!-- Settings toggle -->
           <div style="display:flex;gap:8px;margin-bottom:8px">
             <button class="btn" onclick="toggleSettings()" style="flex:1">⚙ Detection Settings</button>
+            <button style="padding:10px 20px;background:var(--gold);color:#000;border:none;border-radius:6px;font-family:'Rajdhani',sans-serif;font-size:16px;font-weight:800;letter-spacing:2px;cursor:pointer;flex:1" onclick="manualPull()">🗣 PULL</button>
           </div>
           <div id="settingsPanel" style="display:none">
             <div class="setting-row">
@@ -457,7 +458,7 @@ let activeOrder=[],roundStartTime=null,roundResults=null;
 // ── AI state ──────────────────────────────────────────────
 let aiMode=false;
 let aiActive=false;
-let pullDetected=false,bangCooldown=false,fragDetected=false;
+let pullDetected=false,bangCooldown=false,fragDetected=false,scoringLocked=false;
 let trackTimeout=null,delayTimeout=null;
 let stream=null,audioCtx=null,analyser=null,recognition=null,animFrame=null;
 let cfg={bangThreshold:120,shotDelay:200,trackDuration:1500,voiceConfidence:0.75};
@@ -502,7 +503,10 @@ function stopAISession(){
 // ── Camera ────────────────────────────────────────────────
 async function startCamera(){
   try{
-    stream=await navigator.mediaDevices.getUserMedia({video:{width:{ideal:1920},height:{ideal:1080}},audio:false});
+    stream=await navigator.mediaDevices.getUserMedia({
+      video:{width:{ideal:1920},height:{ideal:1080},facingMode:{ideal:'environment'}},
+      audio:false
+    });
     video.srcObject=stream;
     document.getElementById('camOverlay').style.display='none';
     setDot('dotCam','on','CAMERA LIVE');
@@ -526,7 +530,6 @@ const MIN_BLOB_PX=8;
 let gunshotWindow=false;
 let tracks=[];
 let nextId=1;
-let ort=null,session=null,modelLoaded=false;
 
 function iou(a,b){
   const x1=Math.max(a.x,b.x),y1=Math.max(a.y,b.y);
@@ -536,7 +539,7 @@ function iou(a,b){
   return inter/(a.w*a.h+b.w*b.h-inter);
 }
 
-function floodFill(id,smallW,smallH,startX,startY,visited,thresh){
+function floodFill(id,smallW,smallH,startX,startY,visited,thresh,useOrange){
   const stack=[[startX,startY]];
   let minx=startX,miny=startY,maxx=startX,maxy=startY,count=0;
   while(stack.length){
@@ -546,8 +549,11 @@ function floodFill(id,smallW,smallH,startX,startY,visited,thresh){
     if(visited[idx])continue;
     visited[idx]=1;
     const ii=idx*4;
-    const g=(id.data[ii]+id.data[ii+1]+id.data[ii+2])/3;
-    if(g<=thresh)continue;
+    const r=id.data[ii],g=id.data[ii+1],b=id.data[ii+2];
+    let pass=false;
+    if(useOrange){pass=r>140&&g>35&&g<180&&b<90&&r>g*1.3;}
+    else{pass=(r+g+b)/3>thresh;}
+    if(!pass)continue;
     count++;
     minx=Math.min(minx,cx);miny=Math.min(miny,cy);
     maxx=Math.max(maxx,cx);maxy=Math.max(maxy,cy);
@@ -563,23 +569,24 @@ function detectBlobs(off,origW,origH){
   const sctx=small.getContext('2d');
   sctx.drawImage(off,0,0,smallW,smallH);
   const id=sctx.getImageData(0,0,smallW,smallH);
-  const thresh=200;
   const visited=new Uint8Array(smallW*smallH);
   const dets=[];
   const scaleX=origW/smallW,scaleY=origH/smallH;
   for(let y=0;y<smallH;y++){
     for(let x=0;x<smallW;x++){
       const i=(y*smallW+x)*4;
-      const g=(id.data[i]+id.data[i+1]+id.data[i+2])/3;
-      if(g>thresh&&!visited[y*smallW+x]){
-        const r=floodFill(id,smallW,smallH,x,y,visited,thresh);
-        if(r.count>MIN_BLOB_PX){
+      const r=id.data[i],g=id.data[i+1],b=id.data[i+2];
+      // Orange clay pre-filter: high red, medium green, low blue
+      const isOrangeClay=r>150&&g>40&&g<170&&b<80&&r>g*1.4;
+      if(isOrangeClay&&!visited[y*smallW+x]){
+        const result=floodFill(id,smallW,smallH,x,y,visited,0,true);
+        if(result.count>MIN_BLOB_PX){
           dets.push({
-            x:Math.floor(r.minx*scaleX),
-            y:Math.floor(r.miny*scaleY),
-            w:Math.ceil((r.maxx-r.minx+1)*scaleX),
-            h:Math.ceil((r.maxy-r.miny+1)*scaleY),
-            score:Math.min(0.99,r.count/120)
+            x:Math.floor(result.minx*scaleX),
+            y:Math.floor(result.miny*scaleY),
+            w:Math.ceil((result.maxx-result.minx+1)*scaleX),
+            h:Math.ceil((result.maxy-result.miny+1)*scaleY),
+            score:Math.min(0.99,result.count/80)
           });
         }
       }
@@ -628,46 +635,36 @@ function updateTracks(dets,t){
 self.onmessage=async(e)=>{
   const msg=e.data;
   if(msg.type==='init'){
-    if(msg.ortUrl){
-      try{
-        importScripts(msg.ortUrl);
-        ort=self.ort;
-        if(msg.modelUrl){
-          session=await ort.InferenceSession.create(msg.modelUrl);
-          modelLoaded=true;
-          self.postMessage({type:'log',text:'ONNX model loaded ✓'});
-        } else {
-          self.postMessage({type:'log',text:'No model — using flood-fill fallback'});
-        }
-      }catch(err){
-        self.postMessage({type:'log',text:'ONNX unavailable: '+err.message+' — using fallback'});
-      }
-    }
+    // ONNX skipped until model file is available — using flood-fill fallback
+    self.postMessage({type:'log',text:'Worker ready — flood-fill orange detector active'});
   } else if(msg.type==='gunshot'){
     gunshotWindow=true;
     setTimeout(()=>{gunshotWindow=false;},msg.windowMs||2000);
+    self.postMessage({type:'log',text:'Gunshot window opened ('+( msg.windowMs||2000)+'ms)'});
   } else if(msg.type==='frame'){
     const bitmap=msg.bitmap;
     const t=msg.t;
     if(!gunshotWindow&&!msg.force){bitmap.close();return;}
-    const off=new OffscreenCanvas(bitmap.width,bitmap.height);
-    off.getContext('2d').drawImage(bitmap,0,0);
-    bitmap.close();
-    let dets=[];
-    if(modelLoaded&&session){
-      // ONNX slot — model preprocessing would go here
+    // Store dimensions BEFORE closing bitmap
+    const origW=bitmap.width;
+    const origH=bitmap.height;
+    try{
+      const off=new OffscreenCanvas(origW,origH);
+      off.getContext('2d').drawImage(bitmap,0,0);
+      bitmap.close();
+      const dets=detectBlobs(off,origW,origH);
+      updateTracks(dets,t);
+      const out=tracks.map(tr=>{
+        const frag=fragScore(off,tr.box);
+        tr.frag=frag;
+        if(frag>FRAG_THRESH&&tr.frames>=3)tr.hit=true;
+        return {id:tr.id,x:tr.box.x,y:tr.box.y,w:tr.box.w,h:tr.box.h,conf:tr.box.score||0,hit:tr.hit,frag:frag,frames:tr.frames,missed:tr.missed};
+      });
+      self.postMessage({type:'draw',tracks:out,t});
+    }catch(err){
+      try{bitmap.close();}catch(e){}
+      self.postMessage({type:'log',text:'Frame error: '+err.message});
     }
-    if(!dets.length){
-      dets=detectBlobs(off,bitmap.width||off.width,bitmap.height||off.height);
-    }
-    updateTracks(dets,t);
-    const out=tracks.map(tr=>{
-      const frag=fragScore(off,tr.box);
-      tr.frag=frag;
-      if(frag>FRAG_THRESH&&tr.frames>=3)tr.hit=true;
-      return {id:tr.id,x:tr.box.x,y:tr.box.y,w:tr.box.w,h:tr.box.h,conf:tr.box.score||0,hit:tr.hit,frag:frag,frames:tr.frames,missed:tr.missed};
-    });
-    self.postMessage({type:'draw',tracks:out,t});
   }
 };
 `;
@@ -717,6 +714,13 @@ function startCVLoop(){
   loop();
 }
 
+// Manual PULL button — tap when shooter calls pull
+function manualPull(){
+  if(!aiMode){alert('Enable AI mode first.');return;}
+  addShootLog('pull','Manual PULL triggered',null);
+  onTrigger('voice');
+}
+
 // Tell worker a shot was triggered — open analysis window
 function notifyWorkerGunshot(){
   if(cvWorker)cvWorker.postMessage({type:'gunshot',windowMs:cfg.trackDuration+cfg.shotDelay+500});
@@ -725,10 +729,13 @@ function notifyWorkerGunshot(){
 // Draw tracks on canvas (runs on main thread, light)
 function drawTracks(tracks){
   ctx.drawImage(video,0,0,canvas.width,canvas.height);
+
+  // Only act on results if we're in an active tracking window
+  const canScore=aiMode&&!waitRotate&&!roundDone&&!scoringLocked;
+
   tracks.forEach(function(t){
-    if(t.missed>0)return; // only draw live tracks
+    if(t.missed>0)return;
     const locked=t.frames>=4;
-    // Smooth box position
     if(!smoothTracks[t.id]){smoothTracks[t.id]={x:t.x,y:t.y,w:t.w,h:t.h};}
     else{
       const s=smoothTracks[t.id];const a=0.35;
@@ -738,25 +745,16 @@ function drawTracks(tracks){
     const b=smoothTracks[t.id];
     drawTargetBox(b,locked,t.hit,t.frag,t.conf);
 
-    // Fragmentation — auto record result
-    if(t.hit&&!fragDetected){
-      fragDetected=true;
-      updateTrigBar('✅','HIT DETECTED','Fragmentation score: '+t.frag.toFixed(1));
+    // Only record a hit if we're in an active gunshot window and haven't scored yet
+    if(t.hit&&canScore&&t.frames>=3){
+      scoringLocked=true;
+      clearTimeout(trackTimeout);
+      updateTrigBar('✅','HIT DETECTED','Frag score: '+t.frag.toFixed(1));
       recordShot(true);
     }
   });
 
-  // Check if all tracks disappeared = miss
   const liveTracks=tracks.filter(t=>t.missed===0);
-  const prevLive=Object.keys(smoothTracks).length;
-  if(prevLive>0&&liveTracks.length===0&&!fragDetected&&trackFrameCount>=4){
-    setTimeout(function(){
-      if(!fragDetected&&aiMode){
-        updateTrigBar('❌','MISS — CLAY GONE','No fragmentation');
-        recordShot(false);
-      }
-    },300);
-  }
   trackFrameCount=liveTracks.length>0?trackFrameCount+1:0;
   if(liveTracks.length===0){smoothTracks={};}
 }
@@ -855,40 +853,91 @@ function drawWave(){
 // ── Voice ─────────────────────────────────────────────────
 function startVoice(){
   const SR=window.SpeechRecognition||window.webkitSpeechRecognition;
-  if(!SR){setDot('dotVoice','warn','VOICE N/A');return;}
-  recognition=new SR();recognition.continuous=true;recognition.interimResults=true;recognition.lang='en-US';
+  if(!SR){
+    setDot('dotVoice','warn','VOICE N/A');
+    addShootLog('auto','Voice recognition not supported — bang fallback only',null);
+    return;
+  }
+  recognition=new SR();
+  recognition.continuous=true;
+  recognition.interimResults=true;
+  recognition.lang='en-US';
+  recognition.maxAlternatives=3;
+
   recognition.onresult=function(e){
     for(let i=e.resultIndex;i<e.results.length;i++){
-      const t=e.results[i][0].transcript.toLowerCase().trim();
-      const c=e.results[i][0].confidence;
-      if(t.includes('pull')&&c>=cfg.voiceConfidence&&!waitRotate&&!roundDone){
-        pullDetected=true;setTimeout(()=>{pullDetected=false;},3000);
-        addShootLog('pull','"PULL" detected ('+Math.round(c*100)+'%)',null);
-        onTrigger('voice');
+      const result=e.results[i];
+      // Check all alternatives for "pull"
+      for(let j=0;j<result.length;j++){
+        const transcript=result[j].transcript.toLowerCase().trim();
+        const confidence=result[j].confidence||0;
+        // Log what was heard so user can debug
+        if(transcript.length>0){
+          addShootLog('pull','Heard: "'+transcript+'" ('+Math.round(confidence*100)+'%)',null);
+        }
+        // Accept "pull" at any confidence — confidence is 0 on interim results in Safari
+        // Also catch mishearings like "pool", "pole", "bull"
+        const pullWords=['pull','pool','pole','bull','full'];
+        const isPull=pullWords.some(w=>transcript.includes(w));
+        if(isPull&&!waitRotate&&!roundDone&&!scoringLocked){
+          pullDetected=true;
+          setTimeout(()=>{pullDetected=false;},3000);
+          addShootLog('pull','"PULL" confirmed — triggering',null);
+          onTrigger('voice');
+          return; // stop checking once triggered
+        }
       }
     }
   };
-  recognition.onerror=function(e){if(e.error!=='no-speech')setDot('dotVoice','warn',e.error.toUpperCase());};
-  recognition.onend=function(){if(aiActive)setTimeout(()=>{try{recognition.start();}catch(e){}},400);};
-  try{recognition.start();setDot('dotVoice','on','VOICE LIVE');}catch(e){setDot('dotVoice','err','VOICE ERR');}
+
+  recognition.onerror=function(e){
+    addShootLog('auto','Voice error: '+e.error,null);
+    if(e.error==='not-allowed'){
+      setDot('dotVoice','err','MIC DENIED');
+    } else if(e.error!=='no-speech'){
+      setDot('dotVoice','warn',e.error.toUpperCase());
+    }
+  };
+
+  recognition.onend=function(){
+    if(aiActive){
+      setTimeout(()=>{
+        try{recognition.start();}catch(err){
+          addShootLog('auto','Voice restart failed: '+err.message,null);
+        }
+      },300);
+    }
+  };
+
+  recognition.onstart=function(){
+    setDot('dotVoice','on','VOICE LIVE');
+    addShootLog('auto','Voice recognition started — say PULL to trigger',null);
+  };
+
+  try{
+    recognition.start();
+  }catch(e){
+    setDot('dotVoice','err','VOICE ERR');
+    addShootLog('auto','Voice start error: '+e.message,null);
+  }
 }
 
 // ── Trigger pipeline ──────────────────────────────────────
 function onTrigger(src){
-  if(waitRotate||roundDone)return;
-  fragDetected=false;trackFrameCount=0;smoothTracks={};
+  if(waitRotate||roundDone||scoringLocked)return;
+  fragDetected=false;scoringLocked=false;trackFrameCount=0;smoothTracks={};
   updateTrigBar('💥',src==='voice'?'"PULL" HEARD':'BANG DETECTED','Waiting for shot impact...');
   setDot('dotTrack','warn','WAITING');
-  // Tell worker to open its analysis window after shot delay
   delayTimeout=setTimeout(()=>{
     if(!aiActive)return;
     notifyWorkerGunshot();
     updateTrigBar('🔍','TRACKING CLAY','Analyzing fragmentation...');
     setDot('dotTrack','on','TRACKING');
-    // Safety timeout — if worker doesn't report back, score as miss
+    // Safety timeout — score as miss if nothing detected
     trackTimeout=setTimeout(()=>{
-      if(!fragDetected&&aiMode){
-        updateTrigBar('❌','TIMEOUT — MISS','No fragmentation in window');
+      if(!scoringLocked&&aiMode&&!waitRotate&&!roundDone){
+        scoringLocked=true;
+        updateTrigBar('❌','TIMEOUT — MISS','No clay detected in window');
         recordShot(false);
       }
     },cfg.trackDuration+500);
@@ -919,7 +968,7 @@ function recordShot(hit){
     setDot('dotTrack','','IDLE');
     updateTrigBar('👂','LISTENING','Waiting for "PULL" or bang');
     pullDetected=false;trackFrameCount=0;smoothTracks={};
-    setTimeout(()=>{fragDetected=false;},500);
+    scoringLocked=false;fragDetected=false;
   }
   shooterTurnIdx++;
   if(shooterTurnIdx>=activeOrder.length){
